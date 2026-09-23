@@ -15,9 +15,7 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: DATABASE_URL
-        fromDatabase:
-          name: bingo-db
-          property: connectionString
+        sync: false
       - key: ADMIN_IDS
         sync: false
       - key: MINIAPP_URL
@@ -41,9 +39,7 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: DATABASE_URL
-        fromDatabase:
-          name: bingo-db
-          property: connectionString
+        sync: false
       - key: ADMIN_IDS
         sync: false
       - key: MINIAPP_URL
@@ -60,10 +56,3 @@ services:
     envVars:
       - key: VITE_API_URL
         sync: false
-
-databases:
-  - name: bingo-db
-    region: oregon
-    plan: free
-    databaseName: bingo
-    user: bingo
