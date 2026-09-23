@@ -1,0 +1,69 @@
+services:
+  # Backend API Web Service
+  - type: web
+    name: bingo-api
+    runtime: python
+    region: oregon
+    plan: free
+    pythonVersion: "3.11"
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api_server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bingo-db
+          property: connectionString
+      - key: ADMIN_IDS
+        sync: false
+      - key: MINIAPP_URL
+        sync: false
+      - key: API_PORT
+        value: "8000"
+
+  # Telegram Bot Background Worker
+  - type: worker
+    name: bingo-bot
+    runtime: python
+    region: oregon
+    plan: free
+    pythonVersion: "3.11"
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bingo-db
+          property: connectionString
+      - key: ADMIN_IDS
+        sync: false
+      - key: MINIAPP_URL
+        sync: false
+
+  # Miniapp Static Site
+  - type: static
+    name: bingo-miniapp
+    region: oregon
+    plan: free
+    rootDir: miniapp
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        sync: false
+
+databases:
+  - name: bingo-db
+    region: oregon
+    plan: free
+    databaseName: bingo
+    user: bingo
