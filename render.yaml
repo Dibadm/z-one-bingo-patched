@@ -1,5 +1,4 @@
 services:
-  # Backend API Web Service
   - type: web
     name: bingo-api
     runtime: python
@@ -23,7 +22,6 @@ services:
       - key: API_PORT
         value: "8000"
 
-  # Telegram Bot Background Worker
   - type: worker
     name: bingo-bot
     runtime: python
@@ -44,7 +42,3 @@ services:
         sync: false
       - key: MINIAPP_URL
         sync: false
-
-  # Miniapp Static Site - create manually in dashboard as "Static Site"
-  # Root: miniapp, Build: npm install && npm run build, Publish: dist
-  # Env: VITE_API_URL=https://bingo-api.onrender.com
