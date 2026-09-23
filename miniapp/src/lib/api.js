@@ -6,8 +6,7 @@
 
 import { getInitData, getInitDataUnsafe } from './telegram';
 
-const BASE_URL = ''; // same-origin: API server and Mini App are served
-                      // from the same host/deployment (one-host setup)
+const BASE_URL = import.meta.env.VITE_API_URL || ''; // API base URL from env
 
 // call() prepends '/api', so paths MUST start with '/' to produce correct URLs:
 //   '/bootstrap'  -> /api/bootstrap
