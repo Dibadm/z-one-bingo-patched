@@ -45,14 +45,6 @@ services:
       - key: MINIAPP_URL
         sync: false
 
-  # Miniapp Static Site
-  - type: static
-    name: bingo-miniapp
-    region: oregon
-    plan: free
-    rootDir: miniapp
-    buildCommand: npm install && npm run build
-    staticPublishPath: dist
-    envVars:
-      - key: VITE_API_URL
-        sync: false
+  # Miniapp Static Site - create manually in dashboard as "Static Site"
+  # Root: miniapp, Build: npm install && npm run build, Publish: dist
+  # Env: VITE_API_URL=https://bingo-api.onrender.com
