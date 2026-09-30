@@ -10,6 +10,13 @@ import Icon from '../components/Icon';
 
 const LETTERS = ['B', 'I', 'N', 'G', 'O'];
 
+// Server-side countdown is 10s (config.COUNTDOWN_SECONDS) but players see
+// a 30s lobby timer for psychological comfort — the display ticks 3s per
+// real second so it still reaches 0 exactly when the game starts.
+const DISPLAY_COUNTDOWN_SECONDS = 30;
+const SERVER_COUNTDOWN_SECONDS = 10;
+const COUNTDOWN_TICK = 3;
+
 export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
   const { user, runAction, refreshUser } = useStore();
   const [data, setData] = useState(null);
@@ -22,8 +29,11 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
 
   const load = useCallback(async () => {
     const res = await api.getRoomCards(roomFee);
+    // Scale the server's 10s countdown up to a 30s display so the lobby
+    // timer looks right to players even though the real countdown is 10s.
+    const serverRemaining = res.countdown_seconds_remaining ?? null;
+    setCountdown(serverRemaining === null ? null : serverRemaining * (DISPLAY_COUNTDOWN_SECONDS / SERVER_COUNTDOWN_SECONDS));
     setData(res);
-    setCountdown(res.countdown_seconds_remaining ?? null);
     if (res.state === 'running') {
       onGameStart(res.game_id);
     }
@@ -43,7 +53,7 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
           clearInterval(t);
           return c;
         }
-        return c - 1;
+        return c - COUNTDOWN_TICK;
       });
     }, 1000);
     return () => clearInterval(t);
@@ -217,7 +227,7 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
             <div className="waiting-timer">
               <div
                 className="waiting-timer-bar"
-                style={{ width: `${(countdown / (effectiveData?.countdown_total_seconds || 60)) * 100}%` }}
+                style={{ width: `${(countdown / DISPLAY_COUNTDOWN_SECONDS) * 100}%` }}
               />
             </div>
           </div>
