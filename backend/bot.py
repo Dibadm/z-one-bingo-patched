@@ -142,6 +142,28 @@ GROUP_BROADCAST_MSG = {}
 BROADCAST_FAILURE_COUNT = {}
 BROADCAST_FAILED = {}
 
+# Broadcasts queued by the API thread (handle_claim_bingo resolves a game
+# synchronously but can't touch the bot's asyncio loop). The bot's lifecycle
+# loop drains this on every cycle, so group announcements still happen.
+PENDING_BROADCASTS: dict = {}
+
+
+def queue_broadcast(game_id, text):
+    """Called from the API thread (FastAPI/uvicorn) to queue a group
+    announcement. The bot's lifecycle loop drains this via
+    drain_broadcasts() so the actual Telegram send happens on the bot's
+    event loop, not the API thread's."""
+    PENDING_BROADCASTS[game_id] = text
+
+
+async def drain_broadcasts(bot, game_id):
+    """Send any broadcast queued by the API thread. Called from
+    run_game_lifecycle on every cycle so announcements don't lag behind
+    game resolution."""
+    text = PENDING_BROADCASTS.pop(game_id, None)
+    if text is not None:
+        await group_broadcast(bot, game_id, text)
+
 
 async def notify_game_players(bot, game_id, text):
     """DM every player who already has a card in this game — not a broadcast
@@ -348,14 +370,30 @@ def push_call_and_check_wins(game_id, called_numbers):
 
 
 async def resolve_round_winners(bot, game_id, room_fee, winners_found):
+    resolve_game_sync(game_id, room_fee, winners_found)
+    await drain_broadcasts(bot, game_id)
+
+
+def resolve_game_sync(game_id, room_fee, winners_found):
+    """Synchronous game resolution — DB writes only, no Telegram I/O.
+
+    callable from the API thread (FastAPI/uvicorn) so a manual BINGO
+    claim resolves immediately instead of waiting for the bot's lifecycle
+    loop to come around. Queues the group announcement via
+    queue_broadcast() so the bot's event loop sends it on the next cycle.
+    Returns True if the game was resolved, False if it was already
+    finished (e.g. auto-win resolved it first).
+    """
     game = db.get_game(game_id)
+    if game is None or game["state"] == "finished":
+        return False
     pool = game["pool"]
     house_cut = round(pool * config.HOUSE_COMMISSION_PERCENT / 100, 2)
     prize_pool = round(pool - house_cut, 2)
 
     winner_ids = list(winners_found.keys())
     per_winner = round(prize_pool / len(winner_ids), 2)
-    house_wallet = db.credit_house(house_cut)
+    db.credit_house(house_cut)
 
     for uid in winner_ids:
         db.adjust_balance(uid, per_winner)
@@ -375,7 +413,8 @@ async def resolve_round_winners(bot, game_id, room_fee, winners_found):
         winner_lines.append(f"• @{username_masked} — {fmt(per_winner)} ETB — Card #{card_num} ({win_type})")
 
     text = f"🎉 Winners ({len(winner_ids)})\n\n" + "\n".join(winner_lines)
-    await group_broadcast(bot, game_id, text)
+    queue_broadcast(game_id, text)
+    return True
 
 
 async def resolve_round_no_winner(bot, game_id, room_fee, called_numbers):
@@ -492,6 +531,11 @@ async def run_game_lifecycle(bot, room_fee, game_id):
             pool = db.get_pool(game_id)
             text = f"🎱 {letter}-{number} / {amharic}\nCalls: {call_index}/{config.MAX_NUMBERS_CALLED}\nPool: {fmt(pool)} ETB\nPlayers: {player_count}\nLast 6: {history_str}"
             await group_broadcast(bot, game_id, text)
+            # Drain any broadcast queued by the API thread (e.g. a manual
+            # BINGO claim resolved via the Mini App). This keeps group
+            # announcements in sync with game resolution even though the
+            # actual resolution now happens on the API thread.
+            await drain_broadcasts(bot, game_id)
 
             # Check for manual claims frequently during the gap between
             # calls, rather than only once per CALL_DELAY_SECONDS cycle —
@@ -516,7 +560,8 @@ async def run_game_lifecycle(bot, room_fee, game_id):
             winners_found.update(post_loop_result)
 
         if winners_found:
-            await resolve_round_winners(bot, game_id, room_fee, winners_found)
+            resolve_game_sync(game_id, room_fee, winners_found)
+            await drain_broadcasts(bot, game_id)
         else:
             await resolve_round_no_winner(bot, game_id, room_fee, called_numbers)
 

@@ -552,9 +552,15 @@ def handle_mark_number(user_id: int, game_id: int, card_index: int, number: int)
 
 
 def handle_claim_bingo(user_id: int, game_id: int) -> dict:
-    """Manual BINGO claim from the Mini App. Validates structural wins 
-    and persists the claim to the DB so the lifecycle loop can resolve it,
-    even if the API server and bot run in separate processes."""
+    """Manual BINGO claim from the Mini App.
+
+    Resolves the game synchronously here (DB writes only) instead of
+    writing the claim to the DB and waiting for the bot's lifecycle loop
+    to come around — that loop is blocked by sequential DB queries and
+    Telegram broadcast I/O, so claims could lag by several seconds. The
+    group announcement is queued via bot.queue_broadcast() and drained
+    by the lifecycle loop on its next cycle.
+    """
     game = db.get_game(game_id)
     if game is None or game["state"] != "running":
         return {"ok": False, "error": "game_not_running", "message": "This game is not currently running."}
@@ -566,8 +572,30 @@ def handle_claim_bingo(user_id: int, game_id: int) -> dict:
     if not detected:
         return {"ok": False, "error": "no_valid_win", "message": "No valid win on your cards yet."}
 
-    db.record_manual_bingo_claim(game_id, user_id, card_indices)
-    return {"ok": True, "message": "Claim received! Confirming…"}
+    from bot import resolve_game_sync
+    resolved = resolve_game_sync(game_id, game["room_fee"], detected)
+    if not resolved:
+        return {"ok": False, "error": "already_finished", "message": "This game has already been resolved."}
+
+    # resolve_game_sync queues the group announcement via
+    # bot.queue_broadcast(); the lifecycle loop drains it on its next cycle.
+
+    return {
+        "ok": True,
+        "message": "BINGO! You won!",
+        "win_type": list(detected.values())[0],
+        "prize": _winner_prize(game_id, detected),
+    }
+
+
+def _winner_prize(game_id, winners_found):
+    game = db.get_game(game_id)
+    if not game:
+        return 0
+    pool = game["pool"]
+    house_cut = round(pool * config.HOUSE_COMMISSION_PERCENT / 100, 2)
+    prize_pool = round(pool - house_cut, 2)
+    return round(prize_pool / len(winners_found), 2)
 
 # =====================================================================
 # DEPOSIT / WITHDRAW / TRANSFER
