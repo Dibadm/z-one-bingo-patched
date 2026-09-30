@@ -30,7 +30,7 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
     return res;
   }, [roomFee, onGameStart]);
 
-  const { data: pollData, error: pollError, loading } = usePolling(load, {
+  const { data: pollData, error: pollError, loading, execute } = usePolling(load, {
     interval: 2000,
     backoffMax: 30000,
   });
@@ -49,6 +49,14 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [countdown !== null]);
+
+  // When the local countdown hits 0, the game may have just transitioned to
+  // "running" on the server. Don't wait up to 2s for the next scheduled
+  // poll — fetch immediately so the Open My Game button appears without delay.
+  useEffect(() => {
+    if (countdown === 0) execute();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [countdown]);
 
   if (pollError && !data) {
     return (
