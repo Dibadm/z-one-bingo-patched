@@ -1,4 +1,15 @@
 services:
+  - type: static
+    name: bingo-miniapp
+    region: oregon
+    plan: free
+    rootDir: miniapp
+    buildCommand: npm install && npm run build
+    envVars:
+      - key: VITE_API_URL
+        sync: false
+    staticPublishPath: dist
+
   - type: web
     name: bingo-api
     runtime: python
@@ -17,7 +28,7 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
-      - key: MINIAPP_URL
+      - key: MINI_APP_URL
         sync: false
       - key: API_PORT
         value: "8000"
@@ -40,5 +51,5 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
-      - key: MINIAPP_URL
+      - key: MINI_APP_URL
         sync: false

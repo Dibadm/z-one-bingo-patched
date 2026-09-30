@@ -231,7 +231,6 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
           taken={effectiveData.taken_cards}
           mine={effectiveData.my_cards}
           selected={selected}
-          onToggle={toggle}
           onPreview={showPreview}
         />
 
@@ -298,7 +297,7 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
   );
 }
 
-function CardGrid({ poolSize, taken, mine, selected, onToggle, onPreview }) {
+function CardGrid({ poolSize, taken, mine, selected, onPreview }) {
   const takenSet = new Set(taken);
   const mineSet = new Set(mine);
 
@@ -317,8 +316,6 @@ function CardGrid({ poolSize, taken, mine, selected, onToggle, onPreview }) {
       if (isTaken || isMine) return;
       if (onPreview) {
         onPreview(i);
-      } else if (onToggle) {
-        onToggle(i);
       }
     };
 

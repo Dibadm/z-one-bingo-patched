@@ -17,7 +17,8 @@ For the **web** and **worker** services, set these (Render UI → Environment):
 BOT_TOKEN = "<from @BotFather>"
 ADMIN_IDS = [<your numeric Telegram id>]
 BOT_USERNAME = "<your_bot_username>"
-MINI_APP_URL = "https://bingo-miniapp.onrender.com"
+MINI_APP_URL = "https://z-one-bingo-patched-1.onrender.com"
+VITE_API_URL = "https://z-one-bingo-patched.onrender.com"
 GROUP_CHAT_ID = -1001234567890   # optional, for broadcasts
 SUPPORT_USERNAME = <optional>
 ```
@@ -28,7 +29,7 @@ register Telegram's menu button on startup.
 
 ## 2. Verify
 
-- Visit `https://bingo-api.onrender.com/health` → `{"status":"ok"}`
+- Visit `https://z-one-bingo-patched.onrender.com/health` → `{"status":"ok"}`
 - Open your bot in Telegram, send `/start`
 - Tap the menu button or the "Open Habesha Bet" inline button → Mini App loads
 
