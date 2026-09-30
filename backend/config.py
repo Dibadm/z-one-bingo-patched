@@ -84,7 +84,7 @@ CARD_POOL_SIZE = 200             # cards per room
 MAX_CARDS_PER_PLAYER = 5         # max cards a single player can buy in one room
 
 MIN_CARDS_TO_START = 2           # minimum cards sold before a game can start
-COUNTDOWN_SECONDS = 30           # lobby countdown before game starts
+COUNTDOWN_SECONDS = 10           # lobby countdown before game starts
 
 CALL_DELAY_SECONDS = 4           # seconds between number calls
 MAX_NUMBERS_CALLED = 75          # call all 75 balls maximum
