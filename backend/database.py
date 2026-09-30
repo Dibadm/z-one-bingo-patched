@@ -1112,11 +1112,18 @@ def set_game_state(game_id: int, state: str):
 
 
 def finish_game(game_id: int, winner_ids: list, house_cut: float, per_winner_amount: float, winner_cards: dict = None):
+    """Mark the game as finished with the winner data.
+
+    Conditional on state = 'running' so that a second concurrent
+    resolution (e.g. the API thread and the bot's lifecycle loop both
+    trying to resolve the same game) is a no-op instead of silently
+    overwriting the first resolution's prize data.
+    """
     conn = get_connection()
     cur = conn.cursor(cursor_factory=extras.RealDictCursor)
     cur.execute(
         "UPDATE games SET state = 'finished', winner_ids = %s, winner_cards = %s, house_cut = %s, "
-        "per_winner_amount = %s, finished_at = %s WHERE id = %s",
+        "per_winner_amount = %s, finished_at = %s WHERE id = %s AND state = 'running'",
         (json.dumps(winner_ids), json.dumps(winner_cards or {}), house_cut, per_winner_amount, datetime.utcnow().isoformat(), game_id)
     )
     conn.commit()

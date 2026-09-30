@@ -142,10 +142,16 @@ GROUP_BROADCAST_MSG = {}
 BROADCAST_FAILURE_COUNT = {}
 BROADCAST_FAILED = {}
 
+from threading import Lock
+
 # Broadcasts queued by the API thread (handle_claim_bingo resolves a game
 # synchronously but can't touch the bot's asyncio loop). The bot's lifecycle
 # loop drains this on every cycle, so group announcements still happen.
+# Guarded by a lock because the API server and the bot run as separate
+# processes in production — the dict itself is process-local, but the lock
+# keeps the read-modify-write atomic if they ever share a process.
 PENDING_BROADCASTS: dict = {}
+_broadcast_lock = Lock()
 
 
 def queue_broadcast(game_id, text):
@@ -153,14 +159,16 @@ def queue_broadcast(game_id, text):
     announcement. The bot's lifecycle loop drains this via
     drain_broadcasts() so the actual Telegram send happens on the bot's
     event loop, not the API thread's."""
-    PENDING_BROADCASTS[game_id] = text
+    with _broadcast_lock:
+        PENDING_BROADCASTS[game_id] = text
 
 
 async def drain_broadcasts(bot, game_id):
     """Send any broadcast queued by the API thread. Called from
     run_game_lifecycle on every cycle so announcements don't lag behind
     game resolution."""
-    text = PENDING_BROADCASTS.pop(game_id, None)
+    with _broadcast_lock:
+        text = PENDING_BROADCASTS.pop(game_id, None)
     if text is not None:
         await group_broadcast(bot, game_id, text)
 

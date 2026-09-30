@@ -560,6 +560,11 @@ def handle_claim_bingo(user_id: int, game_id: int) -> dict:
     Telegram broadcast I/O, so claims could lag by several seconds. The
     group announcement is queued via bot.queue_broadcast() and drained
     by the lifecycle loop on its next cycle.
+
+    If the synchronous resolution fails for any reason (DB error,
+    concurrent resolution, etc.), the claim is written to
+    manual_bingo_claims as a fallback so the bot's lifecycle loop can
+    still pick it up — this is the old behaviour, kept as a safety net.
     """
     game = db.get_game(game_id)
     if game is None or game["state"] != "running":
@@ -572,20 +577,23 @@ def handle_claim_bingo(user_id: int, game_id: int) -> dict:
     if not detected:
         return {"ok": False, "error": "no_valid_win", "message": "No valid win on your cards yet."}
 
-    from bot import resolve_game_sync
-    resolved = resolve_game_sync(game_id, game["room_fee"], detected)
-    if not resolved:
-        return {"ok": False, "error": "already_finished", "message": "This game has already been resolved."}
+    try:
+        from bot import resolve_game_sync
+        resolved = resolve_game_sync(game_id, game["room_fee"], detected)
+        if resolved:
+            return {
+                "ok": True,
+                "message": "BINGO! You won!",
+                "win_type": list(detected.values())[0],
+                "prize": _winner_prize(game_id, detected),
+            }
+    except Exception:
+        logger.exception("[claim] synchronous resolution failed for game %s, falling back to DB claim", game_id)
 
-    # resolve_game_sync queues the group announcement via
-    # bot.queue_broadcast(); the lifecycle loop drains it on its next cycle.
-
-    return {
-        "ok": True,
-        "message": "BINGO! You won!",
-        "win_type": list(detected.values())[0],
-        "prize": _winner_prize(game_id, detected),
-    }
+    # Fallback: write the claim to the DB so the bot's lifecycle loop
+    # picks it up on its next cycle (the old behaviour).
+    db.record_manual_bingo_claim(game_id, user_id, card_indices)
+    return {"ok": True, "message": "Claim received! Confirming…"}
 
 
 def _winner_prize(game_id, winners_found):
