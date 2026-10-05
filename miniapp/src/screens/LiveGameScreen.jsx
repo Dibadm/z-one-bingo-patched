@@ -122,9 +122,16 @@ export default function LiveGameScreen({ gameId, onFinished }) {
   const claimBingo = async () => {
     haptic.medium();
     try {
-      await runAction(() => api.claimBingo(gameId));
+      const res = await runAction(() => api.claimBingo(gameId));
+      if (res.won) haptic.success();
+      // The backend resolves a valid claim synchronously now — don't wait
+      // for the next scheduled poll (up to 3s away) to find out. Refresh
+      // immediately so the result screen appears right away.
+      await fetchGameState();
     } catch {
-      // already toasted
+      // already toasted; still worth refreshing in case the game state
+      // moved on anyway (e.g. someone else's claim resolved it first).
+      await fetchGameState();
     }
   };
 
