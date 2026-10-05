@@ -552,20 +552,15 @@ def handle_mark_number(user_id: int, game_id: int, card_index: int, number: int)
 
 
 def handle_claim_bingo(user_id: int, game_id: int) -> dict:
-    """Manual BINGO claim from the Mini App.
-
-    Resolves the game synchronously here (DB writes only) instead of
-    writing the claim to the DB and waiting for the bot's lifecycle loop
-    to come around — that loop is blocked by sequential DB queries and
-    Telegram broadcast I/O, so claims could lag by several seconds. The
-    group announcement is queued via bot.queue_broadcast() and drained
-    by the lifecycle loop on its next cycle.
-
-    If the synchronous resolution fails for any reason (DB error,
-    concurrent resolution, etc.), the claim is written to
-    manual_bingo_claims as a fallback so the bot's lifecycle loop can
-    still pick it up — this is the old behaviour, kept as a safety net.
-    """
+    """Manual BINGO claim from the Mini App. Validates the win and, if
+    valid, resolves and pays out the game immediately — right here, in
+    this request — instead of writing a claim and waiting for the bot's
+    lifecycle loop to notice it on its next cycle. The bot and the API
+    run as separate processes in production, so the actual Telegram
+    group announcement is queued for the bot to send on its next check
+    (only it has a live connection to Telegram), but the payout itself
+    and this player's own confirmation happen instantly, synchronously,
+    in this call."""
     game = db.get_game(game_id)
     if game is None or game["state"] != "running":
         return {"ok": False, "error": "game_not_running", "message": "This game is not currently running."}
@@ -577,33 +572,67 @@ def handle_claim_bingo(user_id: int, game_id: int) -> dict:
     if not detected:
         return {"ok": False, "error": "no_valid_win", "message": "No valid win on your cards yet."}
 
-    try:
-        from bot import resolve_game_sync
-        resolved = resolve_game_sync(game_id, game["room_fee"], detected)
-        if resolved:
-            return {
-                "ok": True,
-                "message": "BINGO! You won!",
-                "win_type": list(detected.values())[0],
-                "prize": _winner_prize(game_id, detected),
-            }
-    except Exception:
-        logger.exception("[claim] synchronous resolution failed for game %s, falling back to DB claim", game_id)
-
-    # Fallback: write the claim to the DB so the bot's lifecycle loop
-    # picks it up on its next cycle (the old behaviour).
     db.record_manual_bingo_claim(game_id, user_id, card_indices)
-    return {"ok": True, "message": "Claim received! Confirming…"}
+
+    if not db.try_claim_game_resolution(game_id):
+        # Something else — the bot's own auto-win check, or another
+        # manual claim landing in the same instant — got there first.
+        # Don't pay out again; find out what actually happened instead.
+        return _claim_outcome_after_race(user_id, game_id)
+
+    # We won the race to resolve this game. Gather every other pending
+    # manual claim too (another player's claim could have arrived at
+    # nearly the same moment — multiple winners split the pool, same as
+    # the bot's own detection does), re-validate everyone against the
+    # same called-numbers snapshot, and pay out.
+    winners_found = {user_id: detected}
+    for claim_uid, claimed_cards in db.get_manual_bingo_claims(game_id).items():
+        if claim_uid == user_id:
+            continue
+        other_detected = bingo.evaluate_player_cards_detailed(claimed_cards, called_numbers)
+        if other_detected:
+            winners_found[claim_uid] = other_detected
+
+    result = db.resolve_game_winners(game_id, winners_found)
+    db.clear_manual_bingo_claims(game_id)
+
+    winner_lines_text = "\n".join(
+        f"• @{bingo.mask_username(w['username'] or str(w['user_id']))} — {bot.fmt(w['amount'])} ETB"
+        for w in result["winner_lines"]
+    )
+    db.queue_broadcast(game_id, f"🎉 Winners ({len(result['winner_ids'])})\n\n{winner_lines_text}")
+
+    won = user_id in result["winner_ids"]
+    return {
+        "ok": True,
+        "message": "🎉 BINGO confirmed! You won." if won else "Confirmed — resolved by another player's claim.",
+        "won": won,
+        "amount": result["per_winner_amount"] if won else 0,
+    }
 
 
-def _winner_prize(game_id, winners_found):
-    game = db.get_game(game_id)
-    if not game:
-        return 0
-    pool = game["pool"]
-    house_cut = round(pool * config.HOUSE_COMMISSION_PERCENT / 100, 2)
-    prize_pool = round(pool - house_cut, 2)
-    return round(prize_pool / len(winners_found), 2)
+def _claim_outcome_after_race(user_id: int, game_id: int) -> dict:
+    """Someone else already claimed the right to resolve this game by the
+    time we tried (a rare race: the bot's own auto-win detection, or
+    another manual claim, landed first). Check what actually happened
+    instead of just reporting failure — the other resolver may have
+    already correctly paid out this exact user, and we should say so."""
+    import time
+    import json
+    for _ in range(20):  # poll briefly — the other resolver is mid-flight, not stuck
+        game = db.get_game(game_id)
+        if game and game["state"] == "finished":
+            winner_ids = json.loads(game["winner_ids"]) if game["winner_ids"] else []
+            if user_id in winner_ids:
+                per_winner = float(game["per_winner_amount"] or 0)
+                return {"ok": True, "message": "🎉 BINGO confirmed! You won.", "won": True, "amount": per_winner}
+            return {
+                "ok": False,
+                "error": "already_resolved",
+                "message": "This game was just resolved — you weren't among the winners this time.",
+            }
+        time.sleep(0.1)
+    return {"ok": False, "error": "resolution_pending", "message": "Still resolving — please check back in a moment."}
 
 # =====================================================================
 # DEPOSIT / WITHDRAW / TRANSFER
