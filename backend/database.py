@@ -221,6 +221,22 @@ def _init_tables_impl(cur):
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status)")
 
+    # ---------------- PENDING BROADCASTS ----------------
+    # The API process can resolve a game instantly (a manual claim), but
+    # only the bot process has a live Telegram connection to actually
+    # announce it. This is the handoff: the API queues the announcement
+    # text here, and the bot's lifecycle loop drains and sends it on its
+    # next check.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_broadcasts (
+            id SERIAL PRIMARY KEY,
+            game_id BIGINT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_broadcasts_game ON pending_broadcasts(game_id)")
+
     # ---------------- ADMIN AUDIT LOG ----------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS admin_audit_log (
@@ -1078,11 +1094,12 @@ def get_or_create_active_game(room_fee: float):
 
     if game is None:
         cur.execute(
-            "INSERT INTO games (room_fee, state, pool, created_at) VALUES (%s, 'waiting', 0, %s)",
+            "INSERT INTO games (room_fee, state, pool, created_at) VALUES (%s, 'waiting', 0, %s) RETURNING id",
             (room_fee, datetime.utcnow().isoformat())
         )
+        new_id = cur.fetchone()["id"]
         conn.commit()
-        cur.execute("SELECT * FROM games WHERE id = %s", (cur.lastrowid,))
+        cur.execute("SELECT * FROM games WHERE id = %s", (new_id,))
         game = cur.fetchone()
     release_connection(conn)
     return game
@@ -1112,22 +1129,148 @@ def set_game_state(game_id: int, state: str):
 
 
 def finish_game(game_id: int, winner_ids: list, house_cut: float, per_winner_amount: float, winner_cards: dict = None):
-    """Mark the game as finished with the winner data.
-
-    Conditional on state = 'running' so that a second concurrent
-    resolution (e.g. the API thread and the bot's lifecycle loop both
-    trying to resolve the same game) is a no-op instead of silently
-    overwriting the first resolution's prize data.
-    """
     conn = get_connection()
     cur = conn.cursor(cursor_factory=extras.RealDictCursor)
     cur.execute(
         "UPDATE games SET state = 'finished', winner_ids = %s, winner_cards = %s, house_cut = %s, "
-        "per_winner_amount = %s, finished_at = %s WHERE id = %s AND state = 'running'",
+        "per_winner_amount = %s, finished_at = %s WHERE id = %s",
         (json.dumps(winner_ids), json.dumps(winner_cards or {}), house_cut, per_winner_amount, datetime.utcnow().isoformat(), game_id)
     )
     conn.commit()
     release_connection(conn)
+
+
+def try_claim_game_resolution(game_id: int) -> bool:
+    """Atomically claim the right to resolve (finish) this game.
+
+    Both the API process (an instant manual BINGO claim) and the bot
+    process (its own auto-win detection, or a no-winner timeout) can
+    reach "this game is over, pay out and finish it" independently,
+    since they're separate processes in production with no shared
+    in-memory state. Without a guard here, both could pay out the same
+    pool at once -- the same class of bug as the withdrawal and jackpot
+    races fixed earlier this session.
+
+    Uses a single guarded UPDATE (WHERE state = 'running') exactly like
+    those earlier fixes: only one caller's UPDATE can affect a row, so
+    only one caller gets to proceed to resolve_game_winners. Returns
+    True if this call just moved the game from 'running' to
+    'resolving' (the caller now owns finishing it and MUST follow up
+    with resolve_game_winners or set it back); False if someone else
+    already claimed it moments ago (the caller must NOT pay out or
+    finish the game itself)."""
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+    cur.execute(
+        "UPDATE games SET state = 'resolving' WHERE id = %s AND state = 'running'",
+        (game_id,),
+    )
+    claimed = cur.rowcount > 0
+    conn.commit()
+    release_connection(conn)
+    return claimed
+
+
+def get_cards_for_players(game_id: int, user_ids: list) -> dict:
+    """Batched version of get_player_cards for many players at once --
+    one query instead of one query per player. Returns
+    {user_id: [card_index, ...]}. Used by the per-call win check, which
+    runs for every active game on every single number call, so N
+    sequential per-player queries there scales badly as player counts
+    grow."""
+    if not user_ids:
+        return {}
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+    cur.execute(
+        "SELECT owner_id, card_index FROM game_cards WHERE game_id = %s AND owner_id = ANY(%s)",
+        (game_id, list(user_ids)),
+    )
+    rows = cur.fetchall()
+    release_connection(conn)
+    out = {uid: [] for uid in user_ids}
+    for r in rows:
+        out.setdefault(r["owner_id"], []).append(r["card_index"])
+    return out
+
+
+def resolve_game_winners(game_id: int, winners_found: dict) -> dict:
+    """Pay out winners and finalize the game.
+
+    The caller MUST have already won try_claim_game_resolution for this
+    game_id — this function does not itself guard against concurrent
+    resolution; it assumes that's already been handled, so it's safe to
+    call from either the API process (an instant manual claim) or the
+    bot process (auto-win detection) using the exact same logic either
+    way, instead of two separately-maintained payout code paths.
+
+    Returns a dict describing what happened, for the caller to build an
+    announcement from — this function never talks to Telegram itself,
+    since the API process has no bot connection to do that with."""
+    game = get_game(game_id)
+    pool = float(game["pool"])
+    house_cut = round(pool * config.HOUSE_COMMISSION_PERCENT / 100, 2)
+    prize_pool = round(pool - house_cut, 2)
+
+    winner_ids = list(winners_found.keys())
+    per_winner = round(prize_pool / len(winner_ids), 2) if winner_ids else 0.0
+    credit_house(house_cut)
+
+    for uid in winner_ids:
+        adjust_balance(uid, per_winner)
+        record_transaction(uid, "bingo_win", per_winner, status="completed")
+
+    winner_cards = {uid: list(winners_found[uid].keys()) for uid in winner_ids}
+    finish_game(game_id, winner_ids, house_cut, per_winner, winner_cards)
+
+    winner_lines = []
+    for uid in winner_ids:
+        user = get_user(uid)
+        cards = get_player_cards(game_id, uid)
+        win_type = list(winners_found[uid].values())[0]
+        winner_lines.append({
+            "user_id": uid,
+            "username": user["username"] if user else None,
+            "amount": per_winner,
+            "card_index": cards[0] if cards else None,
+            "win_type": win_type,
+        })
+
+    return {
+        "winner_ids": winner_ids,
+        "per_winner_amount": per_winner,
+        "winner_lines": winner_lines,
+    }
+
+
+def queue_broadcast(game_id: int, text: str):
+    """Queue a message for the bot process to send to the game's group
+    chat. Used when a game is resolved by the API process (an instant
+    manual claim), which has no live Telegram connection of its own."""
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+    cur.execute(
+        "INSERT INTO pending_broadcasts (game_id, text, created_at) VALUES (%s, %s, %s)",
+        (game_id, text, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    release_connection(conn)
+
+
+def drain_broadcasts(game_id: int) -> list:
+    """Fetch and clear any pending broadcast messages queued for this
+    game, so the bot process can actually send them. Safe to call even
+    when nothing is queued (returns an empty list)."""
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+    cur.execute("SELECT id, text FROM pending_broadcasts WHERE game_id = %s ORDER BY id ASC", (game_id,))
+    rows = cur.fetchall()
+    if rows:
+        ids = [r["id"] for r in rows]
+        cur.execute("DELETE FROM pending_broadcasts WHERE id = ANY(%s)", (ids,))
+        conn.commit()
+    release_connection(conn)
+    return [r["text"] for r in rows]
 
 
 def set_game_countdown_start(game_id: int):
