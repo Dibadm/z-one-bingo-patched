@@ -142,36 +142,6 @@ GROUP_BROADCAST_MSG = {}
 BROADCAST_FAILURE_COUNT = {}
 BROADCAST_FAILED = {}
 
-from threading import Lock
-
-# Broadcasts queued by the API thread (handle_claim_bingo resolves a game
-# synchronously but can't touch the bot's asyncio loop). The bot's lifecycle
-# loop drains this on every cycle, so group announcements still happen.
-# Guarded by a lock because the API server and the bot run as separate
-# processes in production — the dict itself is process-local, but the lock
-# keeps the read-modify-write atomic if they ever share a process.
-PENDING_BROADCASTS: dict = {}
-_broadcast_lock = Lock()
-
-
-def queue_broadcast(game_id, text):
-    """Called from the API thread (FastAPI/uvicorn) to queue a group
-    announcement. The bot's lifecycle loop drains this via
-    drain_broadcasts() so the actual Telegram send happens on the bot's
-    event loop, not the API thread's."""
-    with _broadcast_lock:
-        PENDING_BROADCASTS[game_id] = text
-
-
-async def drain_broadcasts(bot, game_id):
-    """Send any broadcast queued by the API thread. Called from
-    run_game_lifecycle on every cycle so announcements don't lag behind
-    game resolution."""
-    with _broadcast_lock:
-        text = PENDING_BROADCASTS.pop(game_id, None)
-    if text is not None:
-        await group_broadcast(bot, game_id, text)
-
 
 async def notify_game_players(bot, game_id, text):
     """DM every player who already has a card in this game — not a broadcast
@@ -361,71 +331,69 @@ async def auto_start_web_app_games(application):
 
 def push_call_and_check_wins(game_id, called_numbers):
     players = db.get_game_players(game_id)
+    auto_player_ids = [p["user_id"] for p in players if p["auto_win"] == 1]
+    cards_by_user = db.get_cards_for_players(game_id, auto_player_ids)
     winners = {}
 
-    for p in players:
-        user_id = p["user_id"]
-        is_auto = p["auto_win"] == 1
-        card_indices = db.get_player_cards(game_id, user_id)
+    for user_id in auto_player_ids:
+        card_indices = cards_by_user.get(user_id, [])
         safe_cards = [_safe_card_index(c) for c in card_indices]
-
-        if is_auto:
-            detected = bingo.evaluate_player_cards_detailed(safe_cards, called_numbers)
-            if detected:
-                winners[user_id] = detected
+        detected = bingo.evaluate_player_cards_detailed(safe_cards, called_numbers)
+        if detected:
+            winners[user_id] = detected
 
     return winners
 
 
 async def resolve_round_winners(bot, game_id, room_fee, winners_found):
-    resolve_game_sync(game_id, room_fee, winners_found)
-    await drain_broadcasts(bot, game_id)
+    """Resolve a winner the bot detected itself (auto-win, or a manual
+    claim it noticed during its own polling). Goes through the same
+    atomic guard and shared payout logic the API's instant manual-claim
+    path uses (database.try_claim_game_resolution /
+    database.resolve_game_winners), so if an instant API claim resolved
+    this exact game in the same instant, only one of them actually pays
+    out — this function just backs off quietly if it loses that race."""
+    if not db.try_claim_game_resolution(game_id):
+        logger.info(f"[lifecycle] game {game_id} already resolved elsewhere (likely an instant API claim) — not paying out again")
+        pending = db.drain_broadcasts(game_id)
+        for text in pending:
+            await group_broadcast(bot, game_id, text)
+        return
 
-
-def resolve_game_sync(game_id, room_fee, winners_found):
-    """Synchronous game resolution — DB writes only, no Telegram I/O.
-
-    callable from the API thread (FastAPI/uvicorn) so a manual BINGO
-    claim resolves immediately instead of waiting for the bot's lifecycle
-    loop to come around. Queues the group announcement via
-    queue_broadcast() so the bot's event loop sends it on the next cycle.
-    Returns True if the game was resolved, False if it was already
-    finished (e.g. auto-win resolved it first).
-    """
-    game = db.get_game(game_id)
-    if game is None or game["state"] == "finished":
-        return False
-    pool = game["pool"]
-    house_cut = round(pool * config.HOUSE_COMMISSION_PERCENT / 100, 2)
-    prize_pool = round(pool - house_cut, 2)
-
-    winner_ids = list(winners_found.keys())
-    per_winner = round(prize_pool / len(winner_ids), 2)
-    db.credit_house(house_cut)
-
-    for uid in winner_ids:
-        db.adjust_balance(uid, per_winner)
-        db.record_transaction(uid, "bingo_win", per_winner, status="completed")
-
-    winner_cards = {uid: list(winners_found[uid].keys()) for uid in winner_ids}
-    db.finish_game(game_id, winner_ids, house_cut, per_winner, winner_cards)
+    result = db.resolve_game_winners(game_id, winners_found)
 
     winner_lines = []
-    for uid in winner_ids:
-        user = db.get_user(uid)
-        username_masked = bingo.mask_username(user["username"] if user else str(uid))
-        cards = db.get_player_cards(game_id, uid)
-        card_idx = _safe_card_index(cards[0]) if cards else 0
-        card_num = card_idx + 1
-        win_type = list(winners_found[uid].values())[0]
-        winner_lines.append(f"• @{username_masked} — {fmt(per_winner)} ETB — Card #{card_num} ({win_type})")
+    for w in result["winner_lines"]:
+        username_masked = bingo.mask_username(w["username"] or str(w["user_id"]))
+        card_num = _safe_card_index(w["card_index"]) + 1 if w["card_index"] is not None else "?"
+        winner_lines.append(f"• @{username_masked} — {fmt(w['amount'])} ETB — Card #{card_num} ({w['win_type']})")
 
-    text = f"🎉 Winners ({len(winner_ids)})\n\n" + "\n".join(winner_lines)
-    queue_broadcast(game_id, text)
-    return True
+    text = f"🎉 Winners ({len(result['winner_ids'])})\n\n" + "\n".join(winner_lines)
+    await group_broadcast(bot, game_id, text)
+
+    # Also send anything the API queued for this game around the same
+    # time (e.g. a different player's instant claim resolved it a moment
+    # before this check ran, but we still won try_claim_game_resolution
+    # for... actually if we won the claim, nothing else could have
+    # queued a resolution broadcast for this same game — this just
+    # covers any other queued message, defensively, so nothing is lost).
+    pending = db.drain_broadcasts(game_id)
+    for extra_text in pending:
+        await group_broadcast(bot, game_id, extra_text)
 
 
 async def resolve_round_no_winner(bot, game_id, room_fee, called_numbers):
+    """No winner found after the maximum number of calls. Still goes
+    through the atomic guard — an instant manual claim via the API could
+    have resolved this game in the same moment the bot's loop was about
+    to give up and refund everyone."""
+    if not db.try_claim_game_resolution(game_id):
+        logger.info(f"[lifecycle] game {game_id} resolved elsewhere right as it was about to be refunded — not refunding")
+        pending = db.drain_broadcasts(game_id)
+        for text in pending:
+            await group_broadcast(bot, game_id, text)
+        return
+
     refunded = db.refund_game(game_id)
     db.set_game_state(game_id, "finished")
     text = f"😔 No winner after {len(called_numbers)} calls. All {len(refunded)} players refunded."
@@ -452,6 +420,22 @@ def _check_manual_claims(game_id, called_numbers):
         if revalidated:
             found[claim_uid] = revalidated
     return found
+
+
+async def _check_externally_resolved(bot, game_id) -> bool:
+    """Check whether this game has already been resolved by someone else
+    — specifically, an instant manual BINGO claim handled directly by the
+    API process, which has no live Telegram connection of its own. If
+    so, send whatever announcement it queued and report True so the
+    calling loop stops immediately instead of continuing to call more
+    numbers for a game that's already over."""
+    game = db.get_game(game_id)
+    if game is None or game["state"] in ("resolving", "finished"):
+        pending = db.drain_broadcasts(game_id)
+        for text in pending:
+            await group_broadcast(bot, game_id, text)
+        return True
+    return False
 
 
 async def run_game_lifecycle(bot, room_fee, game_id):
@@ -514,9 +498,8 @@ async def run_game_lifecycle(bot, room_fee, game_id):
         winners_found = {}
 
         for call_index, number in enumerate(call_sequence[: config.MAX_NUMBERS_CALLED], start=1):
-            fresh_game = db.get_game(game_id)
-            if fresh_game is None or fresh_game["state"] == "finished":
-                logger.info(f"[lifecycle] game {game_id} finished externally at call {call_index} — exiting loop")
+            if await _check_externally_resolved(bot, game_id):
+                logger.info(f"[lifecycle] game {game_id} resolved externally before call {call_index} — exiting loop")
                 return
 
             called_numbers.append(number)
@@ -539,11 +522,6 @@ async def run_game_lifecycle(bot, room_fee, game_id):
             pool = db.get_pool(game_id)
             text = f"🎱 {letter}-{number} / {amharic}\nCalls: {call_index}/{config.MAX_NUMBERS_CALLED}\nPool: {fmt(pool)} ETB\nPlayers: {player_count}\nLast 6: {history_str}"
             await group_broadcast(bot, game_id, text)
-            # Drain any broadcast queued by the API thread (e.g. a manual
-            # BINGO claim resolved via the Mini App). This keeps group
-            # announcements in sync with game resolution even though the
-            # actual resolution now happens on the API thread.
-            await drain_broadcasts(bot, game_id)
 
             # Check for manual claims frequently during the gap between
             # calls, rather than only once per CALL_DELAY_SECONDS cycle —
@@ -551,13 +529,26 @@ async def run_game_lifecycle(bot, room_fee, game_id):
             # to the full delay before the bot notices it.
             claim_poll_step = 0.5
             elapsed = 0.0
+            resolved_externally = False
             while elapsed < config.CALL_DELAY_SECONDS:
                 step = min(claim_poll_step, config.CALL_DELAY_SECONDS - elapsed)
                 await asyncio.sleep(step)
                 elapsed += step
+                if await _check_externally_resolved(bot, game_id):
+                    resolved_externally = True
+                    break
+                # This is a defensive fallback now — the normal path for a
+                # manual claim is handle_claim_bingo resolving it
+                # instantly via the API, which the check above will pick
+                # up as soon as it happens. This only matters if that
+                # somehow didn't complete (e.g. the API process died
+                # mid-request after recording the claim).
                 winners_found.update(_check_manual_claims(game_id, called_numbers))
                 if winners_found:
                     break
+            if resolved_externally:
+                logger.info(f"[lifecycle] game {game_id} resolved externally during inter-call wait — exiting loop")
+                return
             if winners_found:
                 logger.info(f"[lifecycle] WIN DETECTED game {game_id} winners={list(winners_found.keys())} types={list(winners_found.values())}")
                 break
@@ -568,8 +559,7 @@ async def run_game_lifecycle(bot, room_fee, game_id):
             winners_found.update(post_loop_result)
 
         if winners_found:
-            resolve_game_sync(game_id, room_fee, winners_found)
-            await drain_broadcasts(bot, game_id)
+            await resolve_round_winners(bot, game_id, room_fee, winners_found)
         else:
             await resolve_round_no_winner(bot, game_id, room_fee, called_numbers)
 
